@@ -23,34 +23,217 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { appendFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
   type ChannelConfig,
+  getApiUrl,
   getAgentId,
   getMasId,
   getWorkspaceId,
   resolveHandle,
 } from "../config.js";
-import { apiPost } from "../http.js";
 
 type Logger = { info: (s: string) => void; warn: (s: string) => void };
+
+type RoomContext = {
+  roomName: string;
+  namespaceRoom: string;
+  workspaceId: string | null;
+  masId: string | null;
+};
+
+const INGEST_LOG_PATH = join(homedir(), ".openclaw", "ingest-kg-plugin.log");
+
+async function writeIngestLog(level: "INFO" | "WARN", message: string): Promise<void> {
+  const line = `${new Date().toISOString()} [${level}] ${message}\n`;
+  try {
+    await appendFile(INGEST_LOG_PATH, line, "utf-8");
+  } catch {
+    // Avoid surfacing file logger failures into the plugin event path.
+  }
+}
 
 export function installKnowledgeIngest(
   api: OpenClawPluginApi,
   channelCfg: ChannelConfig | null,
-  log: Logger,
+  _log: Logger,
 ): void {
+  const fileLog: Logger = {
+    info: (message: string) => {
+      void writeIngestLog("INFO", message);
+    },
+    warn: (message: string) => {
+      void writeIngestLog("WARN", message);
+    },
+  };
+
+  const logMasId = (): string => cachedRoomContext?.masId || getMasId() || "unset";
+  const cfnLog = (
+    level: "info" | "warn",
+    message: string,
+  ): void => {
+    const line = `[mycelium-cfn] mas_id=${logMasId()} ${message}`;
+    if (level === "warn") {
+      fileLog.warn(line);
+      return;
+    }
+    fileLog.info(line);
+  };
+
+  let cachedRoomContext: RoomContext | null = null;
+  let cachedRoomContextAt = 0;
+  let roomContextPromise: Promise<RoomContext | null> | null = null;
+
+  const roomApiGet = async (path: string): Promise<unknown> => {
+    const base = channelCfg?.backendUrl || getApiUrl();
+    if (!base) {
+      fileLog.warn(`[mycelium] GET ${path} error: missing API URL`);
+      return null;
+    }
+    try {
+      const res = await fetch(`${base}${path}`);
+      if (!res.ok) {
+        fileLog.warn(`[mycelium] GET ${path} → ${res.status}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err) {
+      fileLog.warn(`[mycelium] GET ${path} error: ${err}`);
+      return null;
+    }
+  };
+
+  const roomApiPost = async (path: string, body: unknown): Promise<boolean> => {
+    const base = channelCfg?.backendUrl || getApiUrl();
+    if (!base) {
+      fileLog.warn(`[mycelium] POST ${path} error: missing API URL`);
+      return false;
+    }
+    try {
+      const res = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        fileLog.warn(`[mycelium] POST ${path} → ${res.status}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      fileLog.warn(`[mycelium] POST ${path} error: ${err}`);
+      return false;
+    }
+  };
+
+  const resolveRoomContext = async (): Promise<RoomContext | null> => {
+    const fallback = {
+      workspaceId: getWorkspaceId() || null,
+      masId: getMasId() || null,
+    };
+    const roomName = channelCfg?.room?.trim();
+    if (!roomName) {
+      return fallback.workspaceId || fallback.masId
+        ? {
+            roomName: "(config)",
+            namespaceRoom: "(config)",
+            workspaceId: fallback.workspaceId,
+            masId: fallback.masId,
+          }
+        : null;
+    }
+
+    const now = Date.now();
+    if (cachedRoomContext && now - cachedRoomContextAt < 10_000) {
+      return cachedRoomContext;
+    }
+    if (roomContextPromise) {
+      return roomContextPromise;
+    }
+
+    roomContextPromise = (async () => {
+      const encodedRoom = encodeURIComponent(roomName);
+      const room = (await roomApiGet(`/rooms/${encodedRoom}`)) as
+        | {
+            name?: string;
+            parent_namespace?: string | null;
+            workspace_id?: string | null;
+            mas_id?: string | null;
+          }
+        | null;
+
+      if (!room) {
+        const result = fallback.workspaceId || fallback.masId
+          ? {
+              roomName,
+              namespaceRoom: roomName,
+              workspaceId: fallback.workspaceId,
+              masId: fallback.masId,
+            }
+          : null;
+        cachedRoomContext = result;
+        cachedRoomContextAt = now;
+        return result;
+      }
+
+      let namespaceRoom = room.name || roomName;
+      let workspaceId = room.workspace_id || null;
+      let masId = room.mas_id || null;
+
+      if ((!workspaceId || !masId) && room.parent_namespace) {
+        const encodedParent = encodeURIComponent(room.parent_namespace);
+        const parent = (await roomApiGet(`/rooms/${encodedParent}`)) as
+          | {
+              name?: string;
+              workspace_id?: string | null;
+              mas_id?: string | null;
+            }
+          | null;
+        if (parent) {
+          namespaceRoom = parent.name || room.parent_namespace;
+          workspaceId = parent.workspace_id || workspaceId;
+          masId = parent.mas_id || masId;
+        }
+      }
+
+      if (!workspaceId) workspaceId = fallback.workspaceId;
+      if (!masId) masId = fallback.masId;
+
+      const result = {
+        roomName,
+        namespaceRoom,
+        workspaceId,
+        masId,
+      };
+      cachedRoomContext = result;
+      cachedRoomContextAt = now;
+      return result;
+    })()
+      .finally(() => {
+        roomContextPromise = null;
+      });
+
+    return roomContextPromise;
+  };
+
   // Helper to ingest content to knowledge graph
   const ingestToKnowledge = async (
     content: string,
     agentId: string | undefined,
     metadata?: Record<string, any>,
-  ) => {
-    if (!content?.trim() || content.trim().length < 5) return;
+  ): Promise<boolean> => {
+    if (!content?.trim() || content.trim().length < 5) return false;
 
-    const ws = getWorkspaceId();
-    const ms = getMasId();
-    if (!ws || !ms) return;
+    const target = await resolveRoomContext();
+    const ws = target?.workspaceId;
+    const ms = target?.masId;
+    if (!ws || !ms) {
+      cfnLog("warn", "skipping ingest: workspace_id or mas_id unresolved");
+      return false;
+    }
 
     const ingestAgentId = agentId?.trim() || getAgentId() || undefined;
     const record: Record<string, any> = { response: content };
@@ -58,7 +241,12 @@ export function installKnowledgeIngest(
       Object.assign(record, metadata);
     }
 
-    apiPost(
+    cfnLog(
+      "info",
+      `resolved room=${target?.roomName ?? "unknown"} namespace=${target?.namespaceRoom ?? "unknown"}`,
+    );
+
+    return roomApiPost(
       "/api/knowledge/ingest",
       {
         workspace_id: ws,
@@ -66,8 +254,7 @@ export function installKnowledgeIngest(
         agent_id: ingestAgentId,
         records: [record],
       },
-      log,
-    ).catch((err) => log.warn(`[mycelium] ingest failed: ${err}`));
+    );
   };
 
   // Capture outgoing messages (agent sending to others)
@@ -77,13 +264,14 @@ export function installKnowledgeIngest(
       event: { to: string; content: string; success: boolean },
       ctx: any,
     ) => {
+      cfnLog("info", `event=message_sent success=${event.success}`);
       if (!event.success) return;
 
       const agentId: string | undefined = ctx?.agentId;
       const handle = resolveHandle(agentId);
 
       if (channelCfg?.room) {
-        await apiPost(
+        await roomApiPost(
           `/rooms/${channelCfg.room}/messages`,
           {
             sender_handle: handle,
@@ -91,7 +279,6 @@ export function installKnowledgeIngest(
             message_type: "broadcast",
             content: event.content,
           },
-          log,
         );
       }
 
@@ -109,6 +296,7 @@ export function installKnowledgeIngest(
       event: { from: string; content: string; timestamp?: string },
       ctx: any,
     ) => {
+      cfnLog("info", `event=message_received from=${event.from}`);
       const agentId: string | undefined = ctx?.agentId;
       await ingestToKnowledge(event.content, agentId, {
         message_type: "received",
@@ -125,6 +313,10 @@ export function installKnowledgeIngest(
       event: { targetSessionKey: string; outcome: string; reason?: string },
       ctx: any,
     ) => {
+      cfnLog(
+        "info",
+        `event=subagent_ended session=${event.targetSessionKey} outcome=${event.outcome}`,
+      );
       try {
         // Get complete conversation history from subagent
         const { messages } = await api.runtime.subagent.getSessionMessages({
@@ -173,20 +365,21 @@ export function installKnowledgeIngest(
 
         // Ingest the complete conversation
         const agentId: string | undefined = ctx?.agentId;
-        await ingestToKnowledge(fullConversation, agentId, {
+        const ingested = await ingestToKnowledge(fullConversation, agentId, {
           message_type: "subagent_conversation",
           session_key: event.targetSessionKey,
           outcome: event.outcome,
           message_count: messages.length,
         });
 
-        log.info(
-          `[mycelium] Ingested subagent conversation: ${event.targetSessionKey} (${messages.length} messages)`,
-        );
+        if (ingested) {
+          cfnLog(
+            "info",
+            `Ingested subagent conversation: ${event.targetSessionKey} (${messages.length} messages)`,
+          );
+        }
       } catch (err) {
-        log.warn(
-          `[mycelium] Failed to ingest subagent conversation: ${err}`,
-        );
+        cfnLog("warn", `Failed to ingest subagent conversation: ${err}`);
       }
     },
   );
@@ -206,6 +399,7 @@ export function installKnowledgeIngest(
       },
       ctx: any,
     ) => {
+      cfnLog("info", `event=llm_input run_id=${event.runId ?? "unknown"}`);
       const agentId: string | undefined = ctx?.agentId;
       const sessionKey = ctx?.sessionKey || "main";
 
@@ -255,6 +449,7 @@ export function installKnowledgeIngest(
       },
       ctx: any,
     ) => {
+      cfnLog("info", `event=llm_output run_id=${event.runId ?? "unknown"}`);
       if (!event.assistantTexts || event.assistantTexts.length === 0) return;
 
       const agentId: string | undefined = ctx?.agentId;
